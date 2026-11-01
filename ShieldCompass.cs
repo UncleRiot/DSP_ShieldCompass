@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using BepInEx;
 using BepInEx.Configuration;
 using UnityEngine;
@@ -7,7 +8,7 @@ using UnityEngine.UI;
 
 namespace DSPShieldCompass
 {
-    [BepInPlugin("com.unclecompass.dsp.shieldcompass", "DSP Shield Compass", "0.1.7")]
+    [BepInPlugin("com.unclecompass.dsp.shieldcompass", "DSP Shield Compass", "0.2.6")]
     public sealed class ShieldCompass : BaseUnityPlugin
     {
         // Planetary Shield Generator item/prototype ID in vanilla DSP.
@@ -30,6 +31,57 @@ namespace DSPShieldCompass
         };
 
         private ConfigEntry<bool> enabledSetting;
+        // Independent right-edge dock. DockY is normalized (0..1) for resolution-independent persistence.
+        private ConfigEntry<float> dockY;
+        private ConfigEntry<bool> dockHidden;
+        private ConfigEntry<int> dockFontSize;
+        private ConfigEntry<float> dockUiScale;
+        private ConfigEntry<int> compassFontSize;
+        private ConfigEntry<float> compassUiScale;
+        private bool dockSettingsOpen;
+        private Texture2D dockShieldIcon;
+        private Texture2D dockSettingsIcon;
+        private bool dockDragging;
+        private bool dockExpanded;
+        // SSOT: independent hover dwell timers; never switch dock state in the same instant as pointer entry/exit.
+        private const float DockOpenDelaySeconds = 0.20f;
+        private const float DockCloseDelaySeconds = 0.32f;
+        private float dockHoverEnterAt = -1f;
+        private float dockHoverLeaveAt = -1f;
+        private float dockDragOffset;
+        private float dockPosition = -1f;
+        private GUIStyle dockButtonStyle;
+        private GUIStyle dockIconOnlyStyle;
+        private GUIStyle dockTextStyle;
+        private GUIStyle dockHeaderStyle;
+        private static readonly Dictionary<string, DockModEntry> RegisteredMods =
+            new Dictionary<string, DockModEntry>(StringComparer.Ordinal);
+        private sealed class DockModEntry
+        {
+            public string Id;
+            public string Label;
+            public string Symbol;
+            public Func<bool> Visible;
+            public Action Toggle;
+        }
+
+        // Optional registration for other mods. Register in their Awake; Unregister in OnDestroy.
+        // Visibility delegates belong to the registering mod and are not invoked after unregistering.
+        public static void RegisterMod(string id, string label, string symbol,
+            Func<bool> isVisible, Action toggle)
+        {
+            if (string.IsNullOrEmpty(id) || isVisible == null || toggle == null) return;
+            RegisteredMods[id] = new DockModEntry
+            {
+                Id = id, Label = label ?? id, Symbol = symbol ?? "M", Visible = isVisible, Toggle = toggle
+            };
+        }
+
+        public static void UnregisterMod(string id)
+        {
+            if (!string.IsNullOrEmpty(id)) RegisteredMods.Remove(id);
+        }
+
         // Activation uses a Unity UI button anchored to the game's HUD, not a gameplay hotkey.
         private GameObject hudToggle;
         private RectTransform toolbarAnchor;
@@ -42,7 +94,6 @@ namespace DSPShieldCompass
         private Image hudIcon;
         private Texture2D hudIconTexture;
         private Sprite hudIconSprite;
-        private float nextHudAttempt;
         private bool draggingPanel;
         private Vector2 panelDragOffset;
         private bool[] occupied = new bool[Targets.Length];
@@ -59,6 +110,7 @@ namespace DSPShieldCompass
         private GUIStyle buttonStyle;
         private Texture2D compassArrowTexture;
         private GUIStyle statusStyle;
+        private GUIStyle compassDetailStyle;
         // Optional audit of off-layout and duplicate built generators (read-only).
         private ConfigEntry<bool> auditEnabled;
         private readonly List<ShieldFinding> findings = new List<ShieldFinding>();
@@ -84,6 +136,20 @@ namespace DSPShieldCompass
         private void Awake()
         {
             enabledSetting = Config.Bind("General", "Enabled", false, "Show the shield placement compass.");
+            dockY = Config.Bind("Dock", "VerticalPosition", 0.42f,
+                "Right-edge dock vertical position (0 top / 1 bottom). Left-drag the MOD header to move.");
+            dockHidden = Config.Bind("Dock", "Hidden", false,
+                "Keep dock hidden, except for a small recovery handle on the right edge.");
+            dockFontSize = Config.Bind("Dock", "FontSize", 13,
+                "Font size for the mod dock (11 to 20).");
+            dockUiScale = Config.Bind("Dock", "UIScale", 1f,
+                "Independent mod dock scale (0.75 to 1.50).");
+            compassFontSize = Config.Bind("Compass", "FontSize", 16,
+                "Font size for the shield checklist and compass (12 to 18).");
+            compassUiScale = Config.Bind("Compass", "UIScale", 1f,
+                "Independent shield checklist and compass scale (0.75 to 1.50).");
+            RegisterMod("shieldcompass", "Shield Compass", "S",
+                () => enabledSetting.Value, ToggleHudOverlay);
             // Legacy ToggleKey setting intentionally unused to prevent quickbar conflicts.
             auditEnabled = Config.Bind("Audit", "Enabled", false,
                 "Optional: list off-layout and duplicate shield generators and allow navigation to them.");
@@ -91,28 +157,14 @@ namespace DSPShieldCompass
             buttonY = Config.Bind("Layout", "ButtonY", 108f, "Button top position in screen pixels.");
             arrowX = Config.Bind("Layout", "ArrowCenterX", -1f, "Arrow center X in screen pixels (-1 = initial screen center).");
             arrowY = Config.Bind("Layout", "ArrowCenterY", 133f, "Arrow center Y in screen pixels.");
-            Logger.LogInfo("DSP Shield Compass loaded (display only; no game state changes). Version 0.1.7");
+            Logger.LogInfo("DSP Shield Compass loaded (display only; no game state changes). Version 0.2.6");
         }
+
+        // Legacy toolbar code is retained for compatibility, but no longer invoked.
+        private bool toolbarDiagnosticLogged;
 
         private void Update()
         {
-            if (GameMain.mainPlayer != null)
-            {
-                if (hudToggle == null && Time.unscaledTime >= nextHudAttempt)
-                {
-                    TryCreateHudToggle();
-                    nextHudAttempt = Time.unscaledTime + 3f;
-                }
-                if (hudToggle != null && !hudToggle.activeSelf) hudToggle.SetActive(true);
-                if (hudToggle != null && (lastHudWidth != Screen.width || lastHudHeight != Screen.height))
-                {
-                    // UI scale and resolution can change without recreating the plugin.
-                    DestroyHudToggle();
-                    nextHudAttempt = 0f;
-                }
-            }
-            else if (hudToggle != null && hudToggle.activeSelf) hudToggle.SetActive(false);
-            if (hudIcon != null) hudIcon.color = enabledSetting.Value ? new Color(.78f, .93f, 1f) : Color.white;
             if (!enabledSetting.Value) return;
 
             try
@@ -266,18 +318,26 @@ namespace DSPShieldCompass
                 arrowCenter = new Vector2(arrowX.Value < 0f ? Screen.width * .5f : arrowX.Value, arrowY.Value);
                 layoutLoaded = true;
             }
-            buttonRect.x = Mathf.Clamp(buttonRect.x, 0f, Mathf.Max(0f, Screen.width - buttonRect.width));
-            buttonRect.y = Mathf.Clamp(buttonRect.y, 0f, Mathf.Max(0f, Screen.height - buttonRect.height));
-            arrowCenter.x = Mathf.Clamp(arrowCenter.x, 28f, Mathf.Max(28f, Screen.width - 28f));
-            arrowCenter.y = Mathf.Clamp(arrowCenter.y, 28f, Mathf.Max(28f, Screen.height - 55f));
+            float scale = Mathf.Clamp(compassUiScale.Value, .75f, 1.5f);
+            buttonRect.x = Mathf.Clamp(buttonRect.x, 0f,
+                Mathf.Max(0f, Screen.width - buttonRect.width * scale));
+            buttonRect.y = Mathf.Clamp(buttonRect.y, 0f,
+                Mathf.Max(0f, Screen.height - buttonRect.height * scale));
+            arrowCenter.x = Mathf.Clamp(arrowCenter.x, 28f * scale,
+                Mathf.Max(28f * scale, Screen.width - 28f * scale));
+            arrowCenter.y = Mathf.Clamp(arrowCenter.y, 62f * scale,
+                Mathf.Max(62f * scale, Screen.height - 80f * scale));
         }
 
-        // Drag the overlay by its top header, or the compass arrow, with the right mouse button.
+        // Left-drag only non-interactive areas: the checklist header or compass arrow.
+        // Checklist row clicks and audit buttons retain their normal left-click actions.
         private void HandleDragging(Event e)
         {
-            if (e.type == EventType.MouseDown && e.button == 1)
+            float scale = Mathf.Clamp(compassUiScale.Value, .75f, 1.5f);
+            if (e.type == EventType.MouseDown && e.button == 0)
             {
-                Rect arrowHit = new Rect(arrowCenter.x - 28f, arrowCenter.y - 28f, 56f, 56f);
+                Rect arrowHit = new Rect(arrowCenter.x - 28f * scale,
+                    arrowCenter.y - 28f * scale, 56f * scale, 56f * scale);
                 if (enabledSetting.Value && validScan && (nextTarget >= 0 ||
                     (auditEnabled.Value && GetSelectedFinding() != null)) && arrowHit.Contains(e.mousePosition))
                 {
@@ -287,7 +347,8 @@ namespace DSPShieldCompass
                     e.Use();
                 }
                 else if (enabledSetting.Value &&
-                    new Rect(buttonRect.x, buttonRect.y, buttonRect.width, 27f).Contains(e.mousePosition))
+                    new Rect(buttonRect.x, buttonRect.y, buttonRect.width * scale,
+                        27f * scale).Contains(e.mousePosition))
                 {
                     draggingPanel = true;
                     draggingArrow = false;
@@ -295,7 +356,7 @@ namespace DSPShieldCompass
                     e.Use();
                 }
             }
-            else if (e.type == EventType.MouseDrag && e.button == 1 && (draggingPanel || draggingArrow))
+            else if (e.type == EventType.MouseDrag && e.button == 0 && (draggingPanel || draggingArrow))
             {
                 if (draggingPanel)
                 {
@@ -306,7 +367,7 @@ namespace DSPShieldCompass
                 EnsureLayout();
                 e.Use();
             }
-            else if (e.type == EventType.MouseUp && e.button == 1 && (draggingPanel || draggingArrow))
+            else if (e.type == EventType.MouseUp && e.button == 0 && (draggingPanel || draggingArrow))
             {
                 if (draggingPanel)
                 {
@@ -336,12 +397,24 @@ namespace DSPShieldCompass
         private void TryCreateHudToggle()
         {
             RectTransform bar = FindShortcutBar();
-            if (bar == null) return;
+            if (bar == null)
+            {
+                LogToolbarDiagnostic("No matching shortcut/build bar");
+                return;
+            }
             RectTransform parent = bar.parent as RectTransform;
-            if (parent == null) return;
+            if (parent == null)
+            {
+                LogToolbarDiagnostic("Matched bar has no RectTransform parent: " + GetUiPath(bar));
+                return;
+            }
 
             Canvas rootCanvas = bar.GetComponentInParent<Canvas>();
-            if (rootCanvas == null) return;
+            if (rootCanvas == null)
+            {
+                LogToolbarDiagnostic("Matched bar has no Canvas: " + GetUiPath(bar));
+                return;
+            }
             Camera uiCamera = rootCanvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : rootCanvas.worldCamera;
 
             GameObject old = GameObject.Find("DSPShieldCompass.ExtensionBar");
@@ -416,7 +489,9 @@ namespace DSPShieldCompass
             PositionToolbar(uiCamera);
             lastHudWidth = Screen.width;
             lastHudHeight = Screen.height;
-            Logger.LogInfo("Shield Compass extension attached to UI bar: " + bar.name);
+            Logger.LogInfo("Shield Compass extension attached to UI bar: " + GetUiPath(bar) +
+                "; nativeActive=" + bar.gameObject.activeInHierarchy +
+                "; panel=" + toolbarPanel.anchoredPosition + "; size=" + toolbarPanel.sizeDelta);
         }
 
         private void PositionToolbar(Camera uiCamera)
@@ -424,8 +499,20 @@ namespace DSPShieldCompass
             if (toolbarAnchor == null || toolbarPanel == null) return;
             RectTransform parent = toolbarPanel.parent as RectTransform;
             if (parent == null) return;
+            // When the build menu itself is hidden, use the always-visible Function
+            // Panel background edge, not stale corners of the inactive Build Menu.
+            RectTransform placementAnchor = toolbarAnchor;
+            if (!toolbarAnchor.gameObject.activeInHierarchy)
+            {
+                Transform background = parent.Find("bg-trans/bg");
+                if (background != null && background.gameObject.activeInHierarchy)
+                {
+                    RectTransform visibleRect = background as RectTransform;
+                    if (visibleRect != null) placementAnchor = visibleRect;
+                }
+            }
             Vector3[] corners = new Vector3[4];
-            toolbarAnchor.GetWorldCorners(corners);
+            placementAnchor.GetWorldCorners(corners);
             Vector3 centerRight = (corners[2] + corners[3]) * .5f;
             Vector2 screenPoint = RectTransformUtility.WorldToScreenPoint(uiCamera, centerRight);
             Vector2 localPoint;
@@ -433,37 +520,119 @@ namespace DSPShieldCompass
                 parent, screenPoint, uiCamera, out localPoint)) return;
             // Fixed-size extension, designed for three slots (only first active for now).
             // Width grows as additional buttons are registered in future revisions.
-            toolbarPanel.sizeDelta = new Vector2(66f, Mathf.Max(62f, toolbarAnchor.rect.height * .65f));
+            toolbarPanel.sizeDelta = new Vector2(66f, 62f);
             toolbarPanel.anchoredPosition = localPoint + new Vector2(6f, 0f);
         }
 
-        // Choose only recognizable shortcut/build-bar elements. Avoid snapping to arbitrary HUDs.
+        // SSOT: The player's diagnostic confirmed this exact hierarchy. "Build Menu"
+        // is not necessarily active while the player is in flight or in other modes.
+        // Unity's FindObjectsOfType omits inactive children; search the ACTIVE Function
+        // Panel for both active and inactive RectTransforms instead.
         private static RectTransform FindShortcutBar()
         {
+            RectTransform[] active = FindObjectsOfType<RectTransform>();
+            for (int i = 0; i < active.Length; i++)
+            {
+                RectTransform functionPanel = active[i];
+                if (functionPanel == null || functionPanel.name != "Function Panel") continue;
+                Transform inGame = functionPanel.parent;
+                if (inGame == null || inGame.name != "In Game") continue;
+                Transform overlayCanvas = inGame.parent;
+                if (overlayCanvas == null || overlayCanvas.name != "Overlay Canvas") continue;
+
+                RectTransform[] descendants = functionPanel.GetComponentsInChildren<RectTransform>(true);
+                for (int j = 0; j < descendants.Length; j++)
+                {
+                    RectTransform child = descendants[j];
+                    if (child == null || child.name != "Build Menu" || child.parent != functionPanel) continue;
+                    Canvas canvas = child.GetComponentInParent<Canvas>();
+                    if (canvas == null || canvas.renderMode == RenderMode.WorldSpace) continue;
+                    return child;
+                }
+            }
+            return null;
+        }
+
+        // Read-only, limited diagnostic: identify bottom-screen UI objects and likely bar parents.
+        // No transforms are moved, changed or destroyed. Logs once per plugin load.
+        private void LogToolbarDiagnostic(string reason)
+        {
+            if (toolbarDiagnosticLogged) return;
+            toolbarDiagnosticLogged = true;
+            Logger.LogWarning("[ShieldCompass/UI-DIAG] " + reason +
+                "; screen=" + Screen.width + "x" + Screen.height);
+
             RectTransform[] all = FindObjectsOfType<RectTransform>();
-            RectTransform best = null;
-            int scoreBest = 0;
+            int[] bestScores = new int[16];
+            RectTransform[] candidates = new RectTransform[16];
+            int eligible = 0;
             for (int i = 0; i < all.Length; i++)
             {
                 RectTransform rect = all[i];
                 if (rect == null || !rect.gameObject.activeInHierarchy) continue;
-                string name = rect.gameObject.name.ToLowerInvariant();
-                int score = 0;
-                if (name.Contains("shortcut")) score += 40;
-                if (name.Contains("build-menu") || name.Contains("buildmenu")) score += 35;
-                if (name.Contains("quickbar") || name.Contains("quick-bar")) score += 40;
-                if (name.Contains("function-panel") || name.Contains("functionpanel")) score += 20;
-                if (score == 0) continue;
-                if (rect.rect.width < 250f || rect.rect.height < 35f) continue;
                 Canvas canvas = rect.GetComponentInParent<Canvas>();
                 if (canvas == null || canvas.renderMode == RenderMode.WorldSpace) continue;
-                if (score > scoreBest)
+                if (rect.rect.width < 90f || rect.rect.height < 18f) continue;
+
+                string name = rect.name.ToLowerInvariant();
+                int score = 0;
+                if (name.Contains("shortcut")) score += 80;
+                if (name.Contains("build")) score += 60;
+                if (name.Contains("quick")) score += 60;
+                if (name.Contains("function")) score += 30;
+                if (name.Contains("panel")) score += 10;
+                if (name.Contains("menu")) score += 20;
+                if (name.Contains("bar")) score += 20;
+                if (name.Contains("hud")) score += 10;
+                Vector3[] corners = new Vector3[4];
+                rect.GetWorldCorners(corners);
+                Vector2 center = RectTransformUtility.WorldToScreenPoint(
+                    canvas.renderMode == RenderMode.ScreenSpaceOverlay ? null : canvas.worldCamera,
+                    (corners[0] + corners[2]) * .5f);
+                // Prefer visible elements in the lower section; also include named candidates.
+                if (center.y < Screen.height * .43f && center.y > -60f && center.x > 0f && center.x < Screen.width)
+                    score += 40;
+                if (score < 40) continue;
+                eligible++;
+
+                for (int j = 0; j < candidates.Length; j++)
                 {
-                    best = rect;
-                    scoreBest = score;
+                    if (score <= bestScores[j]) continue;
+                    for (int k = candidates.Length - 1; k > j; k--)
+                    {
+                        candidates[k] = candidates[k - 1];
+                        bestScores[k] = bestScores[k - 1];
+                    }
+                    candidates[j] = rect;
+                    bestScores[j] = score;
+                    break;
                 }
             }
-            return best;
+            Logger.LogInfo("[ShieldCompass/UI-DIAG] Active RectTransforms=" + all.Length +
+                ", candidates=" + eligible + ", top=" + candidates.Length);
+            for (int i = 0; i < candidates.Length; i++)
+            {
+                RectTransform rect = candidates[i];
+                if (rect == null) continue;
+                Logger.LogInfo("[ShieldCompass/UI-DIAG] #" + (i + 1) +
+                    " score=" + bestScores[i] +
+                    " size=" + rect.rect.width.ToString("F0") + "x" + rect.rect.height.ToString("F0") +
+                    " path=" + GetUiPath(rect));
+            }
+            Logger.LogInfo("[ShieldCompass/UI-DIAG] End");
+        }
+
+        private static string GetUiPath(Transform element)
+        {
+            string path = element.name;
+            Transform parent = element.parent;
+            int depth = 0;
+            while (parent != null && depth++ < 9)
+            {
+                path = parent.name + "/" + path;
+                parent = parent.parent;
+            }
+            return path;
         }
 
         private static Texture2D CreateToolbarTexture()
@@ -521,13 +690,19 @@ namespace DSPShieldCompass
             Vector2[] inner = { new Vector2(32, 53), new Vector2(47, 47),
                 new Vector2(45, 28), new Vector2(40, 18), new Vector2(32, 12),
                 new Vector2(24, 18), new Vector2(19, 28), new Vector2(17, 47) };
+            // Distinct compass arrow inside the shield; kept monochrome for DSP styling.
+            Vector2[] pointer = { new Vector2(32, 46), new Vector2(40, 28),
+                new Vector2(35, 30), new Vector2(35, 21), new Vector2(29, 21),
+                new Vector2(29, 30), new Vector2(24, 28) };
             Color[] pixels = new Color[size * size];
             for (int y = 0; y < size; y++)
                 for (int x = 0; x < size; x++)
                 {
                     Vector2 point = new Vector2(x + .5f, y + .5f);
-                    pixels[y * size + x] = IsInsidePolygon(point, outer) &&
-                        !IsInsidePolygon(point, inner) ? Color.white : Color.clear;
+                    bool shieldOutline = IsInsidePolygon(point, outer) &&
+                        !IsInsidePolygon(point, inner);
+                    pixels[y * size + x] = shieldOutline || IsInsidePolygon(point, pointer)
+                        ? Color.white : Color.clear;
                 }
             texture.SetPixels(pixels);
             texture.Apply(false, true);
@@ -548,33 +723,379 @@ namespace DSPShieldCompass
             return null;
         }
 
+        private void InitDockStyles()
+        {
+            if (dockButtonStyle == null)
+            {
+                dockButtonStyle = new GUIStyle(GUI.skin.button)
+                {
+                    fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter
+                };
+                dockButtonStyle.normal.textColor = new Color(.80f, .91f, .96f);
+                dockIconOnlyStyle = new GUIStyle(GUI.skin.label)
+                {
+                    fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter
+                };
+                dockIconOnlyStyle.normal.textColor = new Color(.85f, .92f, .97f);
+                dockTextStyle = new GUIStyle(GUI.skin.label)
+                {
+                    alignment = TextAnchor.MiddleLeft
+                };
+                dockTextStyle.normal.textColor = new Color(.83f, .92f, .97f);
+                dockHeaderStyle = new GUIStyle(GUI.skin.label)
+                {
+                    fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft
+                };
+                dockHeaderStyle.normal.textColor = new Color(.87f, .96f, 1f);
+            }
+            int font = Mathf.Clamp(dockFontSize.Value, 11, 20);
+            float scale = Mathf.Clamp(dockUiScale.Value, .75f, 1.5f);
+            dockButtonStyle.fontSize = Mathf.RoundToInt((font + 2) * scale);
+            dockIconOnlyStyle.fontSize = Mathf.RoundToInt((font + 2) * scale);
+            dockTextStyle.fontSize = Mathf.RoundToInt(font * scale);
+            dockHeaderStyle.fontSize = Mathf.RoundToInt(font * scale);
+        }
+
+        // A single draw-time icon texture is shared by both dock presentations.
+        // The shield outline and compass arrow are rendered from geometry, not a font glyph.
+        private void DrawDockModButton(DockModEntry entry, Rect rect, bool active)
+        {
+            string caption = entry.Id == "shieldcompass" ? "" : entry.Symbol;
+            if (GUI.Button(rect, caption, dockButtonStyle)) SafeToggle(entry);
+            if (entry.Id != "shieldcompass") return;
+
+            if (dockShieldIcon == null) dockShieldIcon = CreateShieldIconTexture();
+            float side = Mathf.Min(rect.width, rect.height) * .70f;
+            Rect iconRect = new Rect(rect.center.x - side * .5f,
+                rect.center.y - side * .5f, side, side);
+            Color previous = GUI.color;
+            try
+            {
+                GUI.color = active ? new Color(.55f, .91f, 1f) : new Color(.85f, .92f, .97f);
+                GUI.DrawTexture(iconRect, dockShieldIcon, ScaleMode.ScaleToFit, true);
+            }
+            finally { GUI.color = previous; }
+        }
+
+        // Collapsed dock: transparent clickable hit area with ONLY the mod icon drawn.
+        // Shared icon source and toggle callback remain the same as in the expanded dock.
+        private void DrawCollapsedModIcon(DockModEntry entry, Rect rect)
+        {
+            if (GUI.Button(rect, new GUIContent("", entry.Label), GUIStyle.none)) SafeToggle(entry);
+
+            if (entry.Id != "shieldcompass")
+            {
+                GUI.Label(rect, entry.Symbol, dockIconOnlyStyle);
+                return;
+            }
+
+            if (dockShieldIcon == null) dockShieldIcon = CreateShieldIconTexture();
+            float side = Mathf.Min(rect.width, rect.height) * .80f;
+            Rect iconRect = new Rect(rect.center.x - side * .5f,
+                rect.center.y - side * .5f, side, side);
+            Color previous = GUI.color;
+            try
+            {
+                GUI.color = new Color(.75f, .91f, .98f);
+                GUI.DrawTexture(iconRect, dockShieldIcon, ScaleMode.ScaleToFit, true);
+            }
+            finally { GUI.color = previous; }
+        }
+
+        // Time-based hysteresis prevents the dock from opening or collapsing on brief pointer passes.
+        private void UpdateDockHover(Rect collapsedRect, Rect expandedRect, Vector2 mousePosition)
+        {
+            if (dockDragging) return;
+
+            float now = Time.unscaledTime;
+            if (!dockExpanded)
+            {
+                dockHoverLeaveAt = -1f;
+                if (!collapsedRect.Contains(mousePosition))
+                {
+                    dockHoverEnterAt = -1f;
+                    return;
+                }
+                if (dockHoverEnterAt < 0f) dockHoverEnterAt = now;
+                if (now - dockHoverEnterAt >= DockOpenDelaySeconds)
+                {
+                    dockExpanded = true;
+                    dockHoverEnterAt = -1f;
+                }
+            }
+            else
+            {
+                dockHoverEnterAt = -1f;
+                if (expandedRect.Contains(mousePosition))
+                {
+                    dockHoverLeaveAt = -1f;
+                    return;
+                }
+                if (dockHoverLeaveAt < 0f) dockHoverLeaveAt = now;
+                if (now - dockHoverLeaveAt >= DockCloseDelaySeconds)
+                {
+                    dockExpanded = false;
+                    dockHoverLeaveAt = -1f;
+                }
+            }
+        }
+
+        // Monochrome vector-derived gear icon (no font glyph or external asset).
+        private static Texture2D CreateSettingsGearTexture()
+        {
+            const int size = 64;
+            Texture2D texture = new Texture2D(size, size, TextureFormat.ARGB32, false);
+            texture.name = "RIOTdock Settings Icon";
+            texture.wrapMode = TextureWrapMode.Clamp;
+            texture.filterMode = FilterMode.Bilinear;
+
+            // Eight teeth with a central cutout. Angles are in radians.
+            Vector2[] outline = new Vector2[8 * 4];
+            const float center = 31.5f;
+            for (int i = 0; i < 8; i++)
+            {
+                float angle = (i * 45f + 22.5f) * Mathf.Deg2Rad;
+                for (int j = 0; j < 4; j++)
+                {
+                    float offset = (j == 0 ? -21f : j == 1 ? -12f : j == 2 ? 12f : 21f) * Mathf.Deg2Rad;
+                    float radius = (j == 1 || j == 2) ? 27f : 20.5f;
+                    float direction = angle + offset;
+                    outline[i * 4 + j] = new Vector2(center + radius * Mathf.Cos(direction),
+                        center + radius * Mathf.Sin(direction));
+                }
+            }
+            Color[] pixels = new Color[size * size];
+            for (int y = 0; y < size; y++)
+                for (int x = 0; x < size; x++)
+                {
+                    Vector2 point = new Vector2(x + .5f, y + .5f);
+                    bool insideGear = IsInsidePolygon(point, outline);
+                    bool centerHole = (point - new Vector2(center, center)).sqrMagnitude < 8.5f * 8.5f;
+                    pixels[y * size + x] = insideGear && !centerHole ? Color.white : Color.clear;
+                }
+            texture.SetPixels(pixels);
+            texture.Apply(false, true);
+            return texture;
+        }
+
+        private void DrawDockSettings(float x, float top, float width, float scale)
+        {
+            GUI.Label(new Rect(x + 12f * scale, top + 2f * scale,
+                width - 24f * scale, 23f * scale), "Dock", dockHeaderStyle);
+            int dockFont = Mathf.Clamp(dockFontSize.Value, 11, 20);
+            GUI.Label(new Rect(x + 12f * scale, top + 28f * scale,
+                width - 24f * scale, 20f * scale), "Text: " + dockFont, dockTextStyle);
+            float newDockFont = GUI.HorizontalSlider(new Rect(x + 18f * scale,
+                top + 49f * scale, width - 36f * scale, 18f * scale), dockFont, 11f, 20f);
+            int dockSize = Mathf.Clamp(Mathf.RoundToInt(newDockFont), 11, 20);
+            if (dockSize != dockFontSize.Value) dockFontSize.Value = dockSize;
+
+            float dockSizeScale = Mathf.Clamp(dockUiScale.Value, .75f, 1.5f);
+            GUI.Label(new Rect(x + 12f * scale, top + 70f * scale,
+                width - 24f * scale, 20f * scale), "UI size: " + dockSizeScale.ToString("F2") + "x", dockTextStyle);
+            float newDockScale = GUI.HorizontalSlider(new Rect(x + 18f * scale,
+                top + 92f * scale, width - 36f * scale, 18f * scale), dockSizeScale, .75f, 1.5f);
+            float snapDockScale = Mathf.Round(newDockScale * 20f) / 20f;
+            if (Mathf.Abs(snapDockScale - dockUiScale.Value) > .001f)
+                dockUiScale.Value = snapDockScale;
+
+            GUI.Label(new Rect(x + 12f * scale, top + 115f * scale,
+                width - 24f * scale, 23f * scale), "Shield Compass", dockHeaderStyle);
+            int compassFont = Mathf.Clamp(compassFontSize.Value, 12, 18);
+            GUI.Label(new Rect(x + 12f * scale, top + 140f * scale,
+                width - 24f * scale, 20f * scale), "Text: " + compassFont, dockTextStyle);
+            float newCompassFont = GUI.HorizontalSlider(new Rect(x + 18f * scale,
+                top + 160f * scale, width - 36f * scale, 18f * scale), compassFont, 12f, 18f);
+            int compassSize = Mathf.Clamp(Mathf.RoundToInt(newCompassFont), 12, 18);
+            if (compassSize != compassFontSize.Value) compassFontSize.Value = compassSize;
+
+            float compassScale = Mathf.Clamp(compassUiScale.Value, .75f, 1.5f);
+            GUI.Label(new Rect(x + 12f * scale, top + 181f * scale,
+                width - 24f * scale, 20f * scale), "UI size: " + compassScale.ToString("F2") + "x", dockTextStyle);
+            float newCompassScale = GUI.HorizontalSlider(new Rect(x + 18f * scale,
+                top + 201f * scale, width - 36f * scale, 18f * scale), compassScale, .75f, 1.5f);
+            float snapCompassScale = Mathf.Round(newCompassScale * 20f) / 20f;
+            if (Mathf.Abs(snapCompassScale - compassUiScale.Value) > .001f)
+                compassUiScale.Value = snapCompassScale;
+        }
+
+        // Right-edge dock, rendered independently of DSP's changing build-menu hierarchy.
+        // Hover the icon strip to expand; left-drag the expanded header to reposition.
+        // Collapsed state has no background; buttons and settings remain clickable.
+        private void DrawModDock(Event e)
+        {
+            InitDockStyles();
+            float scale = Mathf.Clamp(dockUiScale.Value, .75f, 1.5f);
+            float collapsedWidth = 42f * scale;
+            float expandedWidth = 260f * scale;
+            int count = Math.Min(3, RegisteredMods.Count);
+
+            // Collapsed mode shows only currently visible mod icons; no placeholders or labels.
+            DockModEntry[] collapsedEntries = RegisteredMods.Values.Where(SafeVisible).Take(3).ToArray();
+            const float iconSize = 34f;
+            const float iconGap = 14f;
+            float collapsedHeight = (8f + iconSize * Math.Max(1, collapsedEntries.Length)
+                + iconGap * Math.Max(0, collapsedEntries.Length - 1)) * scale;
+            float baseHeight = (34f + 41f * count + 37f) * scale;
+            float settingsHeight = dockSettingsOpen ? 237f * scale : 0f;
+            float height = baseHeight + settingsHeight;
+            if (dockPosition < 0f) dockPosition = Mathf.Clamp01(dockY.Value);
+            float y = dockPosition * Mathf.Max(0f, Screen.height - height);
+            float x = Screen.width - collapsedWidth;
+
+            // A narrow recovery handle is always available, even when permanently hidden.
+            if (dockHidden.Value)
+            {
+                dockExpanded = false;
+                dockHoverEnterAt = -1f;
+                dockHoverLeaveAt = -1f;
+                Rect recovery = new Rect(Screen.width - 15f * scale, y,
+                    15f * scale, 54f * scale);
+                GUI.Box(recovery, GUIContent.none);
+                if (GUI.Button(new Rect(recovery.x, recovery.y + 6f * scale,
+                    recovery.width, 40f * scale), "<", dockButtonStyle))
+                {
+                    dockHidden.Value = false;
+                    Config.Save();
+                }
+                return;
+            }
+
+            Rect tab = new Rect(x, y, collapsedWidth, collapsedHeight);
+            Rect expanded = new Rect(Screen.width - expandedWidth, y, expandedWidth, height);
+            // Event.current.mousePosition may be invalid for Layout/Repaint events;
+            // poll the actual mouse position for stable hover timing across IMGUI event types.
+            Vector2 hoverMouse = new Vector2(Input.mousePosition.x,
+                Screen.height - Input.mousePosition.y);
+            UpdateDockHover(tab, expanded, hoverMouse);
+            bool open = dockExpanded || dockDragging;
+            Rect panel = open ? expanded : tab;
+            Rect settingsButton = new Rect(expanded.x + expandedWidth - 39f * scale,
+                y + 4f * scale, 30f * scale, 26f * scale);
+            Rect dragHeader = open
+                ? new Rect(panel.x, y, panel.width, 32f * scale)
+                : new Rect(0f, 0f, 0f, 0f);
+
+            if (e.type == EventType.MouseDown && e.button == 0 &&
+                dragHeader.Contains(e.mousePosition) &&
+                !(open && settingsButton.Contains(e.mousePosition)))
+            {
+                dockDragging = true;
+                dockDragOffset = e.mousePosition.y - y;
+                e.Use();
+            }
+            else if (e.type == EventType.MouseDrag && e.button == 0 && dockDragging)
+            {
+                float maxY = Mathf.Max(1f, Screen.height - height);
+                dockPosition = Mathf.Clamp01((e.mousePosition.y - dockDragOffset) / maxY);
+                e.Use();
+            }
+            else if (e.type == EventType.MouseUp && e.button == 0 && dockDragging)
+            {
+                dockDragging = false;
+                dockY.Value = dockPosition;
+                Config.Save();
+                e.Use();
+            }
+
+            if (!open)
+            {
+                // No panel box or button backgrounds in collapsed mode.
+                for (int i = 0; i < collapsedEntries.Length; i++)
+                {
+                    Rect button = new Rect(x + 4f * scale,
+                        y + (4f + i * (iconSize + iconGap)) * scale,
+                        iconSize * scale, iconSize * scale);
+                    DrawCollapsedModIcon(collapsedEntries[i], button);
+                }
+                return;
+            }
+
+            Color prior = GUI.color;
+            GUI.color = new Color(.10f, .22f, .30f, .96f);
+            GUI.Box(panel, GUIContent.none);
+            GUI.color = prior;
+
+            GUI.Label(new Rect(expanded.x + 12f * scale, y + 7f * scale,
+                150f * scale, 23f * scale), "RIOTdock", dockHeaderStyle);
+            if (GUI.Button(settingsButton, new GUIContent("", "Settings"), dockButtonStyle))
+                dockSettingsOpen = !dockSettingsOpen;
+            if (dockSettingsIcon == null) dockSettingsIcon = CreateSettingsGearTexture();
+            float gearSize = Mathf.Min(settingsButton.width, settingsButton.height) * .76f;
+            Rect gearRect = new Rect(settingsButton.center.x - gearSize * .5f,
+                settingsButton.center.y - gearSize * .5f, gearSize, gearSize);
+            Color previousGearColor = GUI.color;
+            try
+            {
+                GUI.color = dockSettingsOpen ? new Color(.55f, .91f, 1f) : new Color(.85f, .92f, .97f);
+                GUI.DrawTexture(gearRect, dockSettingsIcon, ScaleMode.ScaleToFit, true);
+            }
+            finally { GUI.color = previousGearColor; }
+            int n = 0;
+            foreach (DockModEntry entry in RegisteredMods.Values)
+            {
+                if (n >= 3) break;
+                float rowY = y + (34f + n * 41f) * scale;
+                bool visible = SafeVisible(entry);
+                Rect icon = new Rect(expanded.x + 9f * scale,
+                    rowY, 37f * scale, 34f * scale);
+                DrawDockModButton(entry, icon, visible);
+                GUI.Label(new Rect(expanded.x + 52f * scale, rowY + 3f * scale,
+                    154f * scale, 27f * scale), entry.Label, dockTextStyle);
+                bool value = GUI.Toggle(new Rect(expanded.x + 223f * scale,
+                    rowY + 9f * scale, 22f * scale, 22f * scale), visible, GUIContent.none);
+                if (value != visible) SafeToggle(entry);
+                n++;
+            }
+
+            if (dockSettingsOpen)
+            {
+                float settingsTop = y + (34f + 41f * count + 6f) * scale;
+                DrawDockSettings(expanded.x, settingsTop, expandedWidth, scale);
+            }
+            bool hide = GUI.Toggle(new Rect(expanded.x + 12f * scale,
+                y + height - 30f * scale, expandedWidth - 24f * scale, 24f * scale),
+                false, "Hide dock (keep recovery tab)");
+            if (hide)
+            {
+                dockHidden.Value = true;
+                Config.Save();
+            }
+        }
+
+        private bool SafeVisible(DockModEntry entry)
+        {
+            try { return entry.Visible(); }
+            catch (Exception ex) { Logger.LogWarning("Mod dock status failed: " + ex.Message); return false; }
+        }
+
+        private void SafeToggle(DockModEntry entry)
+        {
+            try { entry.Toggle(); }
+            catch (Exception ex) { Logger.LogWarning("Mod dock toggle failed: " + ex.Message); }
+        }
+
         private void OnGUI()
         {
             if (GameMain.mainPlayer == null) return;
             Event e = Event.current;
             if (e.type != EventType.Repaint && e.type != EventType.MouseDown &&
                 e.type != EventType.MouseUp && e.type != EventType.MouseDrag && e.type != EventType.Layout) return;
-
             InitStyles();
-            if (hudToggle != null && hudToggle.activeInHierarchy)
-            {
-                RectTransform hitRect = hudToggle.GetComponent<RectTransform>();
-                Canvas parentCanvas = hudToggle.GetComponentInParent<Canvas>();
-                Camera eventCamera = parentCanvas != null &&
-                    parentCanvas.renderMode != RenderMode.ScreenSpaceOverlay ? parentCanvas.worldCamera : null;
-                if (RectTransformUtility.RectangleContainsScreenPoint(hitRect, Input.mousePosition, eventCamera))
-                    GUI.Label(new Rect(Input.mousePosition.x + 10f, Screen.height - Input.mousePosition.y - 27f, 230f, 24f),
-                        "Shield Compass - Show/Hide", labelStyle);
-            }
+            DrawModDock(e);
+            if (!enabledSetting.Value) return;
+
+            float panelHeight = auditEnabled.Value ? 510f : 310f;
+            EnsureLayout();
+            buttonRect.height = panelHeight;
             EnsureLayout();
             HandleDragging(e);
 
-            if (!enabledSetting.Value) return;
-
-            // The HUD button is fixed at the lower right; the checklist remains freely movable.
-            float panelHeight = auditEnabled.Value ? 510f : 310f;
-            buttonRect.height = panelHeight;
-            EnsureLayout();
+            float scale = Mathf.Clamp(compassUiScale.Value, .75f, 1.5f);
+            Matrix4x4 originalMatrix = GUI.matrix;
+            GUI.matrix = ScaleAround(new Vector2(buttonRect.x, buttonRect.y), scale) * originalMatrix;
+            try
+            {
             Rect panel = new Rect(buttonRect.x, buttonRect.y, 298f, panelHeight);
             GUI.Box(panel, GUIContent.none);
             if (!validScan)
@@ -656,11 +1177,28 @@ namespace DSPShieldCompass
                         "Navigate: " + active.Classification + " #" + active.EntityId, rowStyle);
             }
 
+            }
+            finally { GUI.matrix = originalMatrix; }
+
             ShieldFinding navigationFinding = auditEnabled.Value ? GetSelectedFinding() : null;
-            if (navigationFinding != null)
-                RenderCompassToFinding(navigationFinding);
-            else if (nextTarget >= 0)
-                RenderCompass(Targets[nextTarget]);
+            if (navigationFinding != null || nextTarget >= 0)
+            {
+                GUI.matrix = ScaleAround(arrowCenter, scale) * originalMatrix;
+                try
+                {
+                    if (navigationFinding != null) RenderCompassToFinding(navigationFinding);
+                    else RenderCompass(Targets[nextTarget]);
+                }
+                finally { GUI.matrix = originalMatrix; }
+            }
+        }
+
+        private static Matrix4x4 ScaleAround(Vector2 center, float scale)
+        {
+            return Matrix4x4.TRS(new Vector3(center.x, center.y, 0f),
+                Quaternion.identity, new Vector3(scale, scale, 1f)) *
+                Matrix4x4.TRS(new Vector3(-center.x, -center.y, 0f),
+                    Quaternion.identity, Vector3.one);
         }
 
         private int FindCurrentTargetSlot(Vector3 currentDirection)
@@ -727,12 +1265,12 @@ namespace DSPShieldCompass
                 string detail = atNextSpot ? "Build here" :
                     atCompletedSpot ? "Already completed" : "Valid position (not next)";
                 GUI.Label(new Rect(arrowCenter.x - 140f, arrowCenter.y + 34f, 280f, 43f),
-                    "Spot: " + Targets[currentSlot].Name + "\n" + detail, labelStyle);
+                    "Spot: " + Targets[currentSlot].Name + "\n" + detail, compassDetailStyle);
             }
             else
             {
                 GUI.Label(new Rect(arrowCenter.x - 118f, arrowCenter.y + 34f, 236f, 26f),
-                    angularDistance.ToString("F1") + " deg to target", labelStyle);
+                    angularDistance.ToString("F1") + "° away", compassDetailStyle);
             }
         }
 
@@ -765,9 +1303,9 @@ namespace DSPShieldCompass
             }
             DrawCompassArrow(rotation, color);
             GUI.Label(new Rect(arrowCenter.x - 140f, arrowCenter.y + 34f, 280f, 45f),
-                finding.Classification + "  " + distance.ToString("F1") + " deg away\n" +
+                finding.Classification + "  " + distance.ToString("F1") + "° away\n" +
                 FormatCoordinate(finding.Latitude, true) + " " +
-                FormatCoordinate(finding.Longitude, false), labelStyle);
+                FormatCoordinate(finding.Longitude, false), compassDetailStyle);
         }
 
         private void DrawCompassArrow(float rotation, Color color)
@@ -847,7 +1385,18 @@ namespace DSPShieldCompass
 
         private void OnDestroy()
         {
+            UnregisterMod("shieldcompass");
             DestroyHudToggle();
+            if (dockShieldIcon != null)
+            {
+                Destroy(dockShieldIcon);
+                dockShieldIcon = null;
+            }
+            if (dockSettingsIcon != null)
+            {
+                Destroy(dockSettingsIcon);
+                dockSettingsIcon = null;
+            }
             if (compassArrowTexture != null)
             {
                 Destroy(compassArrowTexture);
@@ -857,14 +1406,28 @@ namespace DSPShieldCompass
 
         private void InitStyles()
         {
-            if (labelStyle != null) return;
-            labelStyle = new GUIStyle(GUI.skin.label) { fontSize = 16, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };
-            labelStyle.normal.textColor = Color.white;
-            buttonStyle = new GUIStyle(GUI.skin.button) { fontSize = 14 };
-            rowStyle = new GUIStyle(GUI.skin.label) { fontSize = 13, alignment = TextAnchor.MiddleLeft };
-            rowStyle.normal.textColor = Color.white;
-            statusStyle = new GUIStyle(GUI.skin.label) { fontSize = 14, fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
-            statusStyle.normal.textColor = Color.red;
+            if (labelStyle == null)
+            {
+                labelStyle = new GUIStyle(GUI.skin.label)
+                    { fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleLeft };
+                labelStyle.normal.textColor = Color.white;
+                buttonStyle = new GUIStyle(GUI.skin.button);
+                rowStyle = new GUIStyle(GUI.skin.label)
+                    { alignment = TextAnchor.MiddleLeft };
+                rowStyle.normal.textColor = Color.white;
+                statusStyle = new GUIStyle(GUI.skin.label)
+                    { fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
+                statusStyle.normal.textColor = Color.red;
+                compassDetailStyle = new GUIStyle(GUI.skin.label)
+                    { fontStyle = FontStyle.Bold, alignment = TextAnchor.MiddleCenter };
+                compassDetailStyle.normal.textColor = Color.white;
+            }
+            int font = Mathf.Clamp(compassFontSize.Value, 12, 18);
+            labelStyle.fontSize = font;
+            buttonStyle.fontSize = Mathf.Max(11, font - 2);
+            rowStyle.fontSize = Mathf.Max(11, font - 3);
+            statusStyle.fontSize = Mathf.Max(11, font - 2);
+            compassDetailStyle.fontSize = font;
         }
 
         private static string FormatCoordinate(float angle, bool latitude)

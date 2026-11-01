@@ -3,7 +3,7 @@
     <TargetFramework>net472</TargetFramework>
     <LangVersion>7.3</LangVersion>
     <AssemblyName>DSPShieldCompass</AssemblyName>
-    <Version>0.1.7</Version>
+    <Version>0.9.0</Version>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <GameDir>D:\Spiele\Steam\steamapps\common\Dyson Sphere Program</GameDir>
     <GameManaged>$(GameDir)\DSPGAME_Data\Managed</GameManaged>
